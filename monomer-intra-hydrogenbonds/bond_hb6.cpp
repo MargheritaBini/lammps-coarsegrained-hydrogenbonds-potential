@@ -35,7 +35,8 @@ BondHB62new::~BondHB62new()
     memory->destroy(setflag);
     memory->destroy(epsilon);
     memory->destroy(rhb);
-    memory->destroy(sigma);
+    memory->destroy(sigma_r);
+    memory->destroy(sigma_a);
     memory->destroy(A);
   }
 }
@@ -157,20 +158,39 @@ void BondHB62new::compute(int eflag, int vflag)
 
     // ========== COMPUTE ENERGY TERMS ==========
     
-    double sigma_sq = sigma[type] * sigma[type];
+    double sigma_r_sq = sigma_r[type] * sigma_r[type];  // for radial part (H0)
+    double sigma_a_sq = sigma_a[type] * sigma_a[type];  // for angular part (H1, H2)
     
-    // H0 = -epsilon * exp(-(r - r_hb)^2 / sigma^2)
-    h0 = -epsilon[type] * exp(-pow(r - rhb[type], 2) / sigma_sq);
+    // H0 = -epsilon * exp(-(r - r_hb)^2 / sigma_r^2)
+    h0 = -epsilon[type] * exp(-pow(r - rhb[type], 2) / sigma_r_sq);
     
-    // H1 = exp((|alpha_i| - 1) / sigma^2)
-    h1 = exp((fabs(alpha_i) - 1.0) / sigma_sq);
+    // H1 = exp((|alpha_i| - 1) / sigma_a^2)
+    h1 = exp((fabs(alpha_i) - 1.0) / sigma_a_sq);
     
-    // H2 = exp((|alpha_j| - 1) / sigma^2)
-    h2 = exp((fabs(alpha_j) - 1.0) / sigma_sq);
+    // H2 = exp((|alpha_j| - 1) / sigma_a^2)
+    h2 = exp((fabs(alpha_j) - 1.0) / sigma_a_sq);
     
-    // Barrier term = A * (r_hb / r)^12
+    // Barrier term = A * (r_hb / r)^12, soft-capped below r_cap.
+    // Same rationale as in pair_hb_nonbonded: the raw form diverges as
+    // r -> 0 (force ~1/r^13). Here it acts on an EXPLICITLY BONDED pair,
+    // so a force spike directly translates into the bonded atom being
+    // thrown out of comm range in one step -> "Bond atoms missing".
+    // Below r_cap we switch to a linear (constant-force) extrapolation
+    // matching value and slope at r_cap, keeping the potential C1 and
+    // the force bounded. Tune r_cap_ratio if it clips normal HB formation.
+    const double r_cap_ratio = 0.75;
     double r_eff = rhb[type] / pow(2.0, 1.0/6.0);  // r_hb / 2^(1/6)
-    barrier = A[type] * pow(r_eff / r, 12.0);
+    double r_cap = r_cap_ratio * rhb[type];
+    double dbarrier_dr;
+    if (r >= r_cap) {
+      barrier = A[type] * pow(r_eff / r, 12.0);
+      dbarrier_dr = -12.0 * barrier / r;
+    } else {
+      double barrier_cap = A[type] * pow(r_eff / r_cap, 12.0);
+      double dbarrier_dr_cap = -12.0 * barrier_cap / r_cap;
+      barrier = barrier_cap + dbarrier_dr_cap * (r - r_cap);
+      dbarrier_dr = dbarrier_dr_cap;
+    }
     
     // Total energy U = H0 * H1 * H2 + barrier
     h = h0 * h1 * h2 + barrier;
@@ -179,12 +199,11 @@ void BondHB62new::compute(int eflag, int vflag)
     // Based on frozen backbone approximation where ti_unit and tj_unit are constant
     
     // --- Step 1: Derivative of H0 with respect to r ---
-    // dH0/dr = H0 * (-2(r - r_hb) / sigma^2)
-    double dH0_dr = h0 * (-2.0) * (r - rhb[type]) / sigma_sq;
+    // dH0/dr = H0 * (-2(r - r_hb) / sigma_r^2)
+    double dH0_dr = h0 * (-2.0) * (r - rhb[type]) / sigma_r_sq;
     
     // --- Step 2: Derivative of barrier with respect to r ---
-    // dU_barrier/dr = -12 * barrier / r
-    double dbarrier_dr = -12.0 * barrier / r;
+    // dbarrier_dr already computed above (capped)
     
     // --- Step 3: Sign function for alpha_i and alpha_j ---
     double sgn_alpha_i, sgn_alpha_j;
@@ -202,16 +221,16 @@ void BondHB62new::compute(int eflag, int vflag)
     }
     
     // --- Step 4: Compute gradient vector components for H1 ---
-    // dH1/dr_i = (H1 * sgn(alpha_i) / (sigma^2 * r)) * (ti_unit - alpha_i * rij_hat)
-    double dH1_coeff = (h1 * sgn_alpha_i) / (sigma_sq * r);
+    // dH1/dr_i = (H1 * sgn(alpha_i) / (sigma_a^2 * r)) * (ti_unit - alpha_i * rij_hat)
+    double dH1_coeff = (h1 * sgn_alpha_i) / (sigma_a_sq * r);
     double dH1_dri[3];
     for (int d = 0; d < 3; d++) {
       dH1_dri[d] = dH1_coeff * (ti_unit[d] - alpha_i * rij_hat[d]);
     }
     
     // --- Step 5: Compute gradient vector components for H2 ---
-    // dH2/dr_i = (H2 * sgn(alpha_j) / (sigma^2 * r)) * (tj_unit - alpha_j * rij_hat)
-    double dH2_coeff = (h2 * sgn_alpha_j) / (sigma_sq * r);
+    // dH2/dr_i = (H2 * sgn(alpha_j) / (sigma_a^2 * r)) * (tj_unit - alpha_j * rij_hat)
+    double dH2_coeff = (h2 * sgn_alpha_j) / (sigma_a_sq * r);
     double dH2_dri[3];
     for (int d = 0; d < 3; d++) {
       dH2_dri[d] = dH2_coeff * (tj_unit[d] - alpha_j * rij_hat[d]);
@@ -277,7 +296,8 @@ void BondHB62new::allocate()
 
   memory->create(epsilon, n + 1, "bond:epsilon");
   memory->create(rhb, n + 1, "bond:rhb");
-  memory->create(sigma, n + 1, "bond:sigma");
+  memory->create(sigma_r, n + 1, "bond:sigma_r");
+  memory->create(sigma_a, n + 1, "bond:sigma_a");
   memory->create(A, n + 1, "bond:A");
   memory->create(setflag, n + 1, "bond:setflag");
 
@@ -288,26 +308,28 @@ void BondHB62new::allocate()
 
 void BondHB62new::coeff(int narg, char **arg)
 {
-  if (narg != 5) error->all(FLERR, "Incorrect args for bond coefficients");
+  if (narg != 6) error->all(FLERR, "Incorrect args for bond coefficients");
   if (!allocated) allocate();
 
   int ilo, ihi;
   utils::bounds(FLERR, arg[0], 1, atom->nbondtypes, ilo, ihi, error);
 
   double epsilon_one = utils::numeric(FLERR, arg[1], false, lmp);
-  double rhb_one = utils::numeric(FLERR, arg[2], false, lmp);
-  double sigma_one = utils::numeric(FLERR, arg[3], false, lmp);
-  double A_one = utils::numeric(FLERR, arg[4], false, lmp);
+  double rhb_one     = utils::numeric(FLERR, arg[2], false, lmp);
+  double sigma_r_one = utils::numeric(FLERR, arg[3], false, lmp);
+  double sigma_a_one = utils::numeric(FLERR, arg[4], false, lmp);
+  double A_one       = utils::numeric(FLERR, arg[5], false, lmp);
 
   int count = 0;
   for (int i = ilo; i <= ihi; i++) {
-        epsilon[i] = epsilon_one;
-        rhb[i] = rhb_one;
-        sigma[i] = sigma_one;
-        A[i] = A_one;
-        setflag[i] = 1;
-        count++;
-      }
+    epsilon[i] = epsilon_one;
+    rhb[i]     = rhb_one;
+    sigma_r[i] = sigma_r_one;
+    sigma_a[i] = sigma_a_one;
+    A[i]       = A_one;
+    setflag[i] = 1;
+    count++;
+  }
 
   if (count == 0) error->all(FLERR, "Incorrect args for bond coefficients");
 }
@@ -325,9 +347,10 @@ double BondHB62new::equilibrium_distance(int i)
 void BondHB62new::write_restart(FILE *fp)
 {
   fwrite(&epsilon[1], sizeof(double), atom->nbondtypes, fp);
-  fwrite(&rhb[1], sizeof(double), atom->nbondtypes, fp);
-  fwrite(&sigma[1], sizeof(double), atom->nbondtypes, fp);
-  fwrite(&A[1], sizeof(double), atom->nbondtypes, fp);
+  fwrite(&rhb[1],     sizeof(double), atom->nbondtypes, fp);
+  fwrite(&sigma_r[1], sizeof(double), atom->nbondtypes, fp);
+  fwrite(&sigma_a[1], sizeof(double), atom->nbondtypes, fp);
+  fwrite(&A[1],       sizeof(double), atom->nbondtypes, fp);
 }
 
 /* ----------------------------------------------------------------------
@@ -340,14 +363,16 @@ void BondHB62new::read_restart(FILE *fp)
 
   if (comm->me == 0) {
     utils::sfread(FLERR, &epsilon[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-    utils::sfread(FLERR, &rhb[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-    utils::sfread(FLERR, &sigma[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-    utils::sfread(FLERR, &A[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
+    utils::sfread(FLERR, &rhb[1],     sizeof(double), atom->nbondtypes, fp, nullptr, error);
+    utils::sfread(FLERR, &sigma_r[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
+    utils::sfread(FLERR, &sigma_a[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
+    utils::sfread(FLERR, &A[1],       sizeof(double), atom->nbondtypes, fp, nullptr, error);
   }
   MPI_Bcast(&epsilon[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&rhb[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&sigma[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&A[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
+  MPI_Bcast(&rhb[1],     atom->nbondtypes, MPI_DOUBLE, 0, world);
+  MPI_Bcast(&sigma_r[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
+  MPI_Bcast(&sigma_a[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
+  MPI_Bcast(&A[1],       atom->nbondtypes, MPI_DOUBLE, 0, world);
 
   for (int i = 1; i <= atom->nbondtypes; i++) setflag[i] = 1;
 }
@@ -359,7 +384,7 @@ void BondHB62new::read_restart(FILE *fp)
 void BondHB62new::write_data(FILE *fp)
 {
   for (int i = 1; i <= atom->nbondtypes; i++) {
-    fprintf(fp, "%d %g %g %g %g\n", i, epsilon[i], rhb[i], sigma[i], A[i]);
+    fprintf(fp, "%d %g %g %g %g %g\n", i, epsilon[i], rhb[i], sigma_r[i], sigma_a[i], A[i]);
   }
 }
 
@@ -387,9 +412,12 @@ double BondHB62new::single(int type, double rsq, int i, int j, double &fforce)
   rij_hat[1] = dely / r;
   rij_hat[2] = delz / r;
 
+  // Separate sigma squared for radial and angular parts
+  double sigma_r_sq = sigma_r[type] * sigma_r[type];  // for radial part (H0)
+  double sigma_a_sq = sigma_a[type] * sigma_a[type];  // for angular part (H1, H2)
+
   // Compute the exponential decay term (H0)
-  double sigma_sq = sigma[type] * sigma[type];
-  h0 = -epsilon[type] * exp(-pow(r - rhb[type], 2) / sigma_sq);
+  h0 = -epsilon[type] * exp(-pow(r - rhb[type], 2) / sigma_r_sq);
 
   // Compute angular dependence (H1 and H2)
   double vi1[3], vi2[3], ti[3], ti_unit[3];
@@ -440,38 +468,48 @@ double BondHB62new::single(int type, double rsq, int i, int j, double &fforce)
     alpha_j += rij_hat[d] * tj_unit[d];
   }
 
-  // Compute H1 and H2
-  h1 = exp((fabs(alpha_i) - 1.0) / sigma_sq);
-  h2 = exp((fabs(alpha_j) - 1.0) / sigma_sq);
+  // Compute H1 and H2 using sigma_a
+  h1 = exp((fabs(alpha_i) - 1.0) / sigma_a_sq);
+  h2 = exp((fabs(alpha_j) - 1.0) / sigma_a_sq);
 
-  // Compute barrier
+  // Compute barrier (soft-capped, see compute() for rationale)
+  const double r_cap_ratio = 0.75;
   double r_eff = rhb[type] / pow(2.0, 1.0/6.0);
-  barrier = A[type] * pow(r_eff / r, 12.0);
+  double r_cap = r_cap_ratio * rhb[type];
+  double dbarrier_dr;
+  if (r >= r_cap) {
+    barrier = A[type] * pow(r_eff / r, 12.0);
+    dbarrier_dr = -12.0 * barrier / r;
+  } else {
+    double barrier_cap = A[type] * pow(r_eff / r_cap, 12.0);
+    double dbarrier_dr_cap = -12.0 * barrier_cap / r_cap;
+    barrier = barrier_cap + dbarrier_dr_cap * (r - r_cap);
+    dbarrier_dr = dbarrier_dr_cap;
+  }
   
   // Total energy
   h = h0 * h1 * h2 + barrier;
   
   // ========== FORCE CALCULATION ==========
   
-  // Derivative of H0
-  double dH0_dr = h0 * (-2.0) * (r - rhb[type]) / sigma_sq;
+  // Derivative of H0 using sigma_r
+  double dH0_dr = h0 * (-2.0) * (r - rhb[type]) / sigma_r_sq;
   
-  // Derivative of barrier
-  double dbarrier_dr = -12.0 * barrier / r;
+  // Derivative of barrier already computed above (capped)
   
   // Sign functions
   double sgn_alpha_i = (fabs(alpha_i) < 1e-12) ? 0.0 : ((alpha_i > 0.0) ? 1.0 : -1.0);
   double sgn_alpha_j = (fabs(alpha_j) < 1e-12) ? 0.0 : ((alpha_j > 0.0) ? 1.0 : -1.0);
   
-  // Gradient components for H1
-  double dH1_coeff = (h1 * sgn_alpha_i) / (sigma_sq * r);
+  // Gradient components for H1 using sigma_a
+  double dH1_coeff = (h1 * sgn_alpha_i) / (sigma_a_sq * r);
   double dH1_dri[3];
   for (int d = 0; d < 3; d++) {
     dH1_dri[d] = dH1_coeff * (ti_unit[d] - alpha_i * rij_hat[d]);
   }
   
-  // Gradient components for H2
-  double dH2_coeff = (h2 * sgn_alpha_j) / (sigma_sq * r);
+  // Gradient components for H2 using sigma_a
+  double dH2_coeff = (h2 * sgn_alpha_j) / (sigma_a_sq * r);
   double dH2_dri[3];
   for (int d = 0; d < 3; d++) {
     dH2_dri[d] = dH2_coeff * (tj_unit[d] - alpha_j * rij_hat[d]);

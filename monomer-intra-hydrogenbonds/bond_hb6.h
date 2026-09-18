@@ -37,7 +37,7 @@ class BondHB62new : public Bond {
   double single(int, double, int, int, double &);
 
  protected:
-  double *epsilon, *rhb, *sigma, *A;
+  double *epsilon, *rhb, *sigma_r, *sigma_a, *A;
 
   void allocate();
 };
