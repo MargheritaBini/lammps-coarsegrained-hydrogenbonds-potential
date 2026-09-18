@@ -1,5 +1,13 @@
+// Simplified HB/Elec/Morse pair style
+// Author: Margherita
+// Modified: HB, Morse, Elec act on ALL non-bonded pairs (intra and inter molecule).
+// Intra-molecular HB occupancy is computed geometrically (neighbor scan, same molecule),
+// exactly like inter-molecular occupancy. Topology-based occupancy removed.
+
 #include "pair_hb_nonbonded.h"
 #include <cmath>
+#include <vector>
+#include <unordered_map>
 #include "atom.h"
 #include "neighbor.h"
 #include "neigh_list.h"
@@ -72,6 +80,205 @@ void PairHBNonbonded::compute(int eflag, int vflag)
   double *special_lj   = force->special_lj;
   double *special_coul = force->special_coul;
 
+  // =====================================================================
+  // PRECOMPUTE PER-ATOM HB OCCUPANCY
+  // ---------------------------------------------------------------------
+  // compute_intra_occ(atom_idx) e compute_inter_occ(atom_idx) dipendono
+  // SOLO da atom_idx e dai suoi vicini in neighbor list: NON dipendono
+  // dal partner j del pair loop. Prima venivano richiamate una volta per
+  // ogni vicino j di i (e viceversa), riscansionando ogni volta l'intera
+  // neighbor list di i -> costo O(N*M^2). Qui vengono calcolate una sola
+  // volta per atomo e messe in cache -> costo O(N*M).
+  // =====================================================================
+  int nall = nlocal + atom->nghost;
+  std::vector<double> intra_occ_cache(nall, 0.0);
+  std::vector<double> inter_occ_cache(nall, 0.0);
+
+  // =====================================================================
+  // MAPPA tag -> indice locale (owned + ghost)
+  // ---------------------------------------------------------------------
+  // is_bonded_12_13_14 doveva prima cercare, per ogni legame 1-3 e 1-4,
+  // l'indice locale corrispondente a un tag scorrendo TUTTI gli atomi
+  // locali+ghost (O(nall) per ricerca). Con nall grande questa ricerca
+  // lineare, ripetuta per ogni vicino di ogni atomo, domina il costo di
+  // compute(). Costruendo una volta sola una hash map tag->indice,
+  // ogni ricerca diventa O(1) medio invece di O(nall).
+  // Costo di costruzione: O(nall), fatto una sola volta per timestep.
+  // =====================================================================
+  std::unordered_map<tagint,int> tag_to_local;
+  tag_to_local.reserve(nall * 2);
+  for (int k = 0; k < nall; k++) {
+    tag_to_local[atom->tag[k]] = k;
+  }
+
+  // Helper: is atom k a 1-2, 1-3 or 1-4 bonded neighbor of atom_idx?
+  auto is_bonded_12_13_14 = [&](int atom_idx, int k) -> bool {
+    tagint k_tag = atom->tag[k];
+    int nb = atom->num_bond[atom_idx];
+    for (int ib = 0; ib < nb; ib++) {
+      tagint mid_tag = atom->bond_atom[atom_idx][ib];
+      if (mid_tag == k_tag) return true;   // 1-2
+
+      // 1-3: check if k is bonded to any neighbor of atom_idx
+      auto it_m = tag_to_local.find(mid_tag);
+      if (it_m == tag_to_local.end()) continue;  // partner fuori dal dominio locale+ghost
+      int m = it_m->second;
+
+      int nb2 = atom->num_bond[m];
+      for (int mb = 0; mb < nb2; mb++) {
+        tagint mid2_tag = atom->bond_atom[m][mb];
+        if (mid2_tag == k_tag) return true;  // 1-3
+
+        // 1-4: check if k is bonded to any 1-3 neighbor
+        auto it_p = tag_to_local.find(mid2_tag);
+        if (it_p == tag_to_local.end()) continue;
+        int p = it_p->second;
+
+        int nb3 = atom->num_bond[p];
+        for (int pb = 0; pb < nb3; pb++) {
+          if (atom->bond_atom[p][pb] == k_tag) return true;  // 1-4
+        }
+      }
+    }
+    return false;
+  };
+
+  // ---------------------------------------------------------------
+  // GEOMETRY-BASED INTRA-MOLECULAR HB OCCUPANCY
+  // Scan neighbor list for atoms of the SAME molecule satisfying
+  // HB geometry (distance + normal alignment), exactly as inter.
+  // Excludes 1-2 and 1-3 pairs (backbone neighbors).
+  // ---------------------------------------------------------------
+  auto compute_intra_occ = [&](int atom_idx) -> double {
+    double intra_occ = 0.0;
+    int total_arr = atom->nlocal + atom->nghost;
+
+    const double d_on  = 7.0;
+    const double d_off = 10.0;
+
+    double ni[3];
+    compute_normal_vector(x, atom_idx, ni);
+    bool has_valid_normal = (atom_idx >= 1 && atom_idx < total_arr - 1);
+
+    if (atom_idx >= list->inum) return 0.0;
+    int *jlist_inner = firstneigh[atom_idx];
+    int  jnum_inner  = numneigh[atom_idx];
+
+    for (int jj_inner = 0; jj_inner < jnum_inner; jj_inner++) {
+      int k = jlist_inner[jj_inner];
+      k &= NEIGHMASK;
+
+      // Only atoms of the SAME molecule
+      if (atom->molecule[k] != atom->molecule[atom_idx]) continue;
+
+      // Skip 1-2 and 1-3 bonded pairs
+      if (is_bonded_12_13_14(atom_idx, k)) continue;
+
+      double dx = x[atom_idx][0] - x[k][0];
+      double dy = x[atom_idx][1] - x[k][1];
+      double dz = x[atom_idx][2] - x[k][2];
+      double dist = sqrt(dx*dx + dy*dy + dz*dz);
+
+      if (dist >= d_off) continue;
+
+      double s_dist;
+      if (dist <= d_on) {
+        s_dist = 1.0;
+      } else {
+        double t = (dist - d_on) / (d_off - d_on);
+        s_dist = 1.0 - t*t*t*(10.0 - 15.0*t + 6.0*t*t);
+      }
+
+      double s_ang = 0.0;
+      bool k_interior = (k >= 1 && k < total_arr - 1);
+      if (has_valid_normal && k_interior) {
+        double nk[3];
+        compute_normal_vector(x, k, nk);
+        double cos_th = fabs(ni[0]*nk[0] + ni[1]*nk[1] + ni[2]*nk[2]);
+        const double ang_low = 0.65, ang_high = 0.75;
+        if (cos_th >= ang_high) {
+          s_ang = 1.0;
+        } else if (cos_th > ang_low) {
+          double t = (cos_th - ang_low) / (ang_high - ang_low);
+          s_ang = t*t*(3.0 - 2.0*t);
+        }
+      }
+      intra_occ += s_dist * s_ang;
+    }
+    if (intra_occ > 2.0) intra_occ = 2.0;
+    return intra_occ;
+  };
+
+  // ---------------------------------------------------------------
+  // GEOMETRY-BASED INTER-MOLECULAR HB OCCUPANCY (unchanged logic)
+  // Scan neighbor list for atoms of a DIFFERENT molecule.
+  // ---------------------------------------------------------------
+  auto compute_inter_occ = [&](int atom_idx) -> double {
+    double inter_occ = 0.0;
+    int total_arr = atom->nlocal + atom->nghost;
+
+    const double d_on  = 7.0;
+    const double d_off = 10.0;
+
+    double ni[3];
+    compute_normal_vector(x, atom_idx, ni);
+    bool has_valid_normal = (atom_idx >= 1 && atom_idx < total_arr - 1);
+
+    if (atom_idx >= list->inum) return 0.0;
+    int *jlist_inner = firstneigh[atom_idx];
+    int  jnum_inner  = numneigh[atom_idx];
+
+    for (int jj_inner = 0; jj_inner < jnum_inner; jj_inner++) {
+      int k = jlist_inner[jj_inner];
+      k &= NEIGHMASK;
+
+      // Only atoms of a DIFFERENT molecule
+      if (atom->molecule[k] == atom->molecule[atom_idx]) continue;
+
+      double dx = x[atom_idx][0] - x[k][0];
+      double dy = x[atom_idx][1] - x[k][1];
+      double dz = x[atom_idx][2] - x[k][2];
+      double dist = sqrt(dx*dx + dy*dy + dz*dz);
+
+      if (dist >= d_off) continue;
+
+      double s_dist;
+      if (dist <= d_on) {
+        s_dist = 1.0;
+      } else {
+        double t = (dist - d_on) / (d_off - d_on);
+        s_dist = 1.0 - t*t*t*(10.0 - 15.0*t + 6.0*t*t);
+      }
+
+      double s_ang = 0.0;
+      bool k_interior = (k >= 1 && k < total_arr - 1);
+      if (has_valid_normal && k_interior) {
+        double nk[3];
+        compute_normal_vector(x, k, nk);
+        double cos_th = fabs(ni[0]*nk[0] + ni[1]*nk[1] + ni[2]*nk[2]);
+        const double ang_low = 0.65, ang_high = 0.75;
+        if (cos_th >= ang_high) {
+          s_ang = 1.0;
+        } else if (cos_th > ang_low) {
+          double t = (cos_th - ang_low) / (ang_high - ang_low);
+          s_ang = t*t*(3.0 - 2.0*t);
+        }
+      }
+      inter_occ += s_dist * s_ang;
+    }
+    if (inter_occ > 2.0) inter_occ = 2.0;
+    return inter_occ;
+  };
+
+  // Riempi la cache UNA volta per ciascun atomo owned (i in ilist).
+  // Gli atomi ghost restano a 0.0, esattamente come faceva il codice
+  // originale (return 0.0 per atom_idx >= list->inum).
+  for (int ii_pre = 0; ii_pre < inum; ii_pre++) {
+    int iatom = ilist[ii_pre];
+    intra_occ_cache[iatom] = compute_intra_occ(iatom);
+    inter_occ_cache[iatom] = compute_inter_occ(iatom);
+  }
+
   for (ii = 0; ii < inum; ii++) {
     i = ilist[ii];
     xtmp = x[i][0];
@@ -132,226 +339,50 @@ void PairHBNonbonded::compute(int eflag, int vflag)
 
         }
 
+
+
         // ========== HYDROGEN BOND POTENTIAL (NON-RADIAL) ==========
         if (epsilon_hb[itype][jtype] != 0.0) {
-          
-          // Check if atoms are from different molecules using LAMMPS molecule IDs.
-          // Works for any number of chains, as long as mol-id is set correctly
-          // in the data file Atoms section.
-          tagint mol_i = atom->molecule[i];
-          tagint mol_j = atom->molecule[j];
-          bool different_molecules = (mol_i != mol_j);
-          
-          // SMOOTH VERSION: compute continuous occupancy of intramolecular hb6barriernew bonds
-          // instead of a binary count. occupancy in [0,1] per bond; sum capped at 1.
-          // This avoids abrupt force discontinuities when the intra-HB breaks/forms.
-          double i_hb_occupancy = 0.0;
-          int num_bonds_i = atom->num_bond[i];
-          if (num_bonds_i > 0) {
-            int *bond_type_i = atom->bond_type[i];
-            int *bond_atom_i = atom->bond_atom[i];
-            tagint *tag = atom->tag;
-            int nlocal_atoms = atom->nlocal;
-            int total_atoms_arr = nlocal_atoms + atom->nghost;
 
-            // Distance switching: 1 at r=0, smoothly 0 at r=d_switch_off
-            const double d_switch_on  = 7.0;   // fully formed below this distance
-            const double d_switch_off = 10.0;   // fully broken above this distance
+          bool same_molecule = (atom->molecule[i] == atom->molecule[j]);
 
-            double ni[3];
-            compute_normal_vector(x, i, ni);
-            bool i_has_valid_normal = (i >= 1 && i < total_atoms_arr - 1);
-            
-            for (int ib = 0; ib < num_bonds_i; ib++) {
-              if (bond_type_i[ib] > 1) {
-                tagint bonded_tag = bond_atom_i[ib];
-                
-                int bonded_idx = -1;
-                for (int k = 0; k < total_atoms_arr; k++) {
-                  if (tag[k] == bonded_tag) { bonded_idx = k; break; }
-                }
-                
-                if (bonded_idx >= 0 && atom->molecule[bonded_idx] == atom->molecule[i]) {
-                  double dx = x[i][0] - x[bonded_idx][0];
-                  double dy = x[i][1] - x[bonded_idx][1];
-                  double dz = x[i][2] - x[bonded_idx][2];
-                  double bond_dist = sqrt(dx*dx + dy*dy + dz*dz);
-                  
-                  if (bond_dist < d_switch_off) {
-                    // Smooth 5th-order distance switch: 1 when close, 0 when far
-                    double s_dist;
-                    if (bond_dist <= d_switch_on) {
-                      s_dist = 1.0;
-                    } else {
-                      double t = (bond_dist - d_switch_on) / (d_switch_off - d_switch_on); // 0->1
-                      s_dist = 1.0 - t * t * t * (10.0 - 15.0 * t + 6.0 * t * t);
-                    }
-                    
-                    // Smooth angular switch: 1 when normals are aligned, 0 at threshold
-                    double s_ang = 0.0;
-                    bool bonded_is_interior = (bonded_idx >= 1 && bonded_idx < total_atoms_arr - 1);
-                    if (i_has_valid_normal && bonded_is_interior) {
-                        double nb[3];
-                        compute_normal_vector(x, bonded_idx, nb);
-                        double cos_theta = fabs(ni[0]*nb[0] + ni[1]*nb[1] + ni[2]*nb[2]);
-                        const double ang_low  = 0.65;
-                        const double ang_high = 0.75;  // == hb_parallel_threshold
-                        if (cos_theta >= ang_high) {
-                          s_ang = 1.0;
-                        } else if (cos_theta > ang_low) {
-                          double t = (cos_theta - ang_low) / (ang_high - ang_low);
-                          s_ang = t * t * (3.0 - 2.0 * t);
-                        }
-                      }
-                    
-                    i_hb_occupancy += s_dist * s_ang;
-                  }
-                }
-              }
+          // Returns true if i and j are connected by a declared HB bond (bond type > 1).
+          // These pairs are excluded from the HB potential (no double-counting with bonded),
+          // but ARE included in compute_intra_occ to contribute to occupancy.
+          auto is_hb_bond = [&](int atom_idx, int k) -> bool {
+            tagint k_tag = atom->tag[k];
+            int nb = atom->num_bond[atom_idx];
+            int *btype = atom->bond_type[atom_idx];
+            tagint *batom = atom->bond_atom[atom_idx];
+            for (int ib = 0; ib < nb; ib++) {
+              if (btype[ib] > 1 && batom[ib] == k_tag) return true;
             }
-            if (i_hb_occupancy > 2.0) i_hb_occupancy = 2.0;  // cap at 2: max 2 intra-HBs counted
-          }
-          
-          // SMOOTH VERSION: same continuous occupancy for atom j
-          double j_hb_occupancy = 0.0;
-          int num_bonds_j = atom->num_bond[j];
-          if (num_bonds_j > 0) {
-            int *bond_type_j = atom->bond_type[j];
-            int *bond_atom_j = atom->bond_atom[j];
-            tagint *tag = atom->tag;
-            int nlocal_atoms = atom->nlocal;
-            int total_atoms_arr = nlocal_atoms + atom->nghost;
-
-            const double d_switch_on  = 7.0;
-            const double d_switch_off = 10.0;
-
-            double nj[3];
-            compute_normal_vector(x, j, nj);
-            bool j_has_valid_normal = (j >= 1 && j < total_atoms_arr - 1);
-            
-            for (int jb = 0; jb < num_bonds_j; jb++) {
-              if (bond_type_j[jb] > 1) {
-                tagint bonded_tag = bond_atom_j[jb];
-                
-                int bonded_idx = -1;
-                for (int k = 0; k < total_atoms_arr; k++) {
-                  if (tag[k] == bonded_tag) { bonded_idx = k; break; }
-                }
-                
-                if (bonded_idx >= 0 && atom->molecule[bonded_idx] == atom->molecule[j]) {
-                  double dx = x[j][0] - x[bonded_idx][0];
-                  double dy = x[j][1] - x[bonded_idx][1];
-                  double dz = x[j][2] - x[bonded_idx][2];
-                  double bond_dist = sqrt(dx*dx + dy*dy + dz*dz);
-                  
-                  if (bond_dist < d_switch_off) {
-                    double s_dist;
-                    if (bond_dist <= d_switch_on) {
-                      s_dist = 1.0;
-                    } else {
-                      double t = (bond_dist - d_switch_on) / (d_switch_off - d_switch_on);
-                      s_dist = 1.0 - t * t * t * (10.0 - 15.0 * t + 6.0 * t * t);
-                    }
-                    
-                    double s_ang = 0.0;
-                    bool bonded_is_interior = (bonded_idx >= 1 && bonded_idx < total_atoms_arr - 1);
-                    if (j_has_valid_normal && bonded_is_interior) {
-                        double nb[3];
-                        compute_normal_vector(x, bonded_idx, nb);
-                        double cos_theta = fabs(nj[0]*nb[0] + nj[1]*nb[1] + nj[2]*nb[2]);
-                        const double ang_low  = 0.65;
-                        const double ang_high = 0.75;
-                        if (cos_theta >= ang_high) {
-                          s_ang = 1.0;
-                        } else if (cos_theta > ang_low) {
-                          double t = (cos_theta - ang_low) / (ang_high - ang_low);
-                          s_ang = t * t * (3.0 - 2.0 * t);
-                        }
-                      }
-                    
-                    j_hb_occupancy += s_dist * s_ang;
-                  }
-                }
-              }
-            }
-            if (j_hb_occupancy > 2.0) j_hb_occupancy = 2.0;  // cap at 2: max 2 intra-HBs counted
-          }
-
-          // ---------------------------------------------------------------
-          // COMPUTE INTERMOLECULAR HB OCCUPANCY for atoms i and j
-          // Scans ALL atoms of the other molecule in the neighbor list
-          // (geometry-based, no pre-declared bond required)
-          // ---------------------------------------------------------------
-          auto compute_inter_occ = [&](int atom_idx, tagint mol_id) -> double {
-            double inter_occ = 0.0;
-            int total_arr = atom->nlocal + atom->nghost;
-
-            const double d_on  = 7.0;
-            const double d_off = 10.0;
-
-            double ni[3];
-            compute_normal_vector(x, atom_idx, ni);
-            bool has_valid_normal = (atom_idx >= 1 && atom_idx < total_arr - 1);
-
-            // Use neighbor list: scan all neighbors of atom_idx
-            // firstneigh/numneigh are populated for all atoms in ilist;
-            // for ghost atoms (j) the list may be empty, which is safe.
-            if (atom_idx >= list->inum) return 0.0;  // atom_idx not in ilist, skip
-            int *jlist_inner = firstneigh[atom_idx];
-            int  jnum_inner  = numneigh[atom_idx];
-
-            for (int jj_inner = 0; jj_inner < jnum_inner; jj_inner++) {
-              int k = jlist_inner[jj_inner];
-              k &= NEIGHMASK;
-
-              // Only consider atoms from a DIFFERENT molecule (works for any number of chains)
-              if (atom->molecule[k] == mol_id) continue;  // same molecule, skip
-
-              double dx = x[atom_idx][0] - x[k][0];
-              double dy = x[atom_idx][1] - x[k][1];
-              double dz = x[atom_idx][2] - x[k][2];
-              double dist = sqrt(dx*dx + dy*dy + dz*dz);
-
-              if (dist >= d_off) continue;
-
-              double s_dist;
-              if (dist <= d_on) {
-                s_dist = 1.0;
-              } else {
-                double t = (dist - d_on) / (d_off - d_on);
-                s_dist = 1.0 - t * t * t * (10.0 - 15.0 * t + 6.0 * t * t);
-              }
-
-              double s_ang = 0.0;
-              bool k_interior = (k >= 1 && k < total_arr - 1);
-              if (has_valid_normal && k_interior) {
-                double nk[3];
-                compute_normal_vector(x, k, nk);
-                double cos_th = fabs(ni[0]*nk[0] + ni[1]*nk[1] + ni[2]*nk[2]);
-                const double ang_low = 0.65, ang_high = 0.75;
-                if (cos_th >= ang_high) {
-                  s_ang = 1.0;
-                } else if (cos_th > ang_low) {
-                  double t = (cos_th - ang_low) / (ang_high - ang_low);
-                  s_ang = t * t * (3.0 - 2.0 * t);
-                }
-              }
-              inter_occ += s_dist * s_ang;
-            }
-            if (inter_occ > 2.0) inter_occ = 2.0;
-            return inter_occ;
+            return false;
           };
 
-          double i_inter_occ = compute_inter_occ(i, mol_i);
-          double j_inter_occ = compute_inter_occ(j, mol_j);
+          // ---------------------------------------------------------------
+          // Lookup dell'occupancy dalla cache pre-calcolata (una volta per
+          // atomo, PRIMA del doppio loop sulle coppie). Nessun ricalcolo
+          // qui: i valori sono già pronti in intra_occ_cache/inter_occ_cache.
+          // Per gli atomi ghost (j >= inum) il valore resta 0.0, identico
+          // al comportamento originale.
+          // ---------------------------------------------------------------
+          double i_hb_occupancy = intra_occ_cache[i];
+          double j_hb_occupancy = intra_occ_cache[j];
+          double i_inter_occ    = inter_occ_cache[i];
+          double j_inter_occ    = inter_occ_cache[j];
 
           // ---------------------------------------------------------------
           // MUTUAL EXCLUSION:
-          // (A) Inter suppresses intra: reduce intra occupancy by inter occupancy
-          //     so that when inter is formed, intra is not counted as blocking inter.
-          // (B) Intra suppresses inter: original logic below.
+          // (A) Inter suppresses intra: reduce intra occupancy by inter occupancy.
+          //     When an inter-HB is formed, the intra occupancy is partially reduced
+          //     so it does not block the inter HB.
+          // (B) Intra suppresses inter: when intra-HB occupancy is high, the HB
+          //     potential for the current pair (inter or intra) is scaled down.
+          //
+          // For intra pairs: inter_hb_scale is always 1.0 (intra does not suppress
+          // itself via the inter gate — the intra occ of i and j is the same pool).
           // ---------------------------------------------------------------
-          // Smooth ramp: 0 at occ=0, 1 at occ>=1
           auto ramp1 = [](double occ) -> double {
             if (occ <= 0.0) return 0.0;
             if (occ >= 1.0) return 1.0;
@@ -359,133 +390,73 @@ void PairHBNonbonded::compute(int eflag, int vflag)
             return u * u * (3.0 - 2.0 * u);
           };
 
-          // (A) Reduce intra occupancy by intermolecular occupancy (mutual exclusion)
-          double inter_suppress_factor_i = 1.0 - ramp1(i_inter_occ);
-          double inter_suppress_factor_j = 1.0 - ramp1(j_inter_occ);
+          // (A) Reduce intra occupancy by intermolecular occupancy.
+          const double alpha_suppress = 1.00;
+          double inter_suppress_factor_i = 1.0 - alpha_suppress * ramp1(i_inter_occ);
+          double inter_suppress_factor_j = 1.0 - alpha_suppress * ramp1(j_inter_occ);
           i_hb_occupancy *= inter_suppress_factor_i;
           j_hb_occupancy *= inter_suppress_factor_j;
 
-          // ---------------------------------------------------------------
-          // SMOOTH GATE: suppress intermolecular HB when intra occupancy is high.
-          // (original logic, now with intra occ already reduced by inter occ above)
-          // ---------------------------------------------------------------
+          // (B) Smooth gate: suppress inter-HB when intra occupancy is high.
+          // For same-molecule pairs, no self-suppression via this gate.
+          //
+          // Tuning vs original:
+          //   threshold raised 0.5 -> 0.8: gate only activates when intra nearly saturated
+          //   max suppression reduced: 1.0 -> 0.5: inter HB never fully blocked by intra
           auto ramp2 = [](double occ) -> double {
-            if (occ <= 0.5) return 0.0;
+            const double low = 0.8;   // was 0.5
+            if (occ <= low) return 0.0;
             if (occ >= 1.0) return 1.0;
-            double u = (occ - 0.5) / 0.5;
+            double u = (occ - low) / (1.0 - low);
             return u * u * (3.0 - 2.0 * u);
           };
-          double suppress_i = ramp2(i_hb_occupancy);
-          double suppress_j = ramp2(j_hb_occupancy);
-          double max_suppress = (suppress_i > suppress_j) ? suppress_i : suppress_j;
-          double inter_hb_scale = 1.0 - max_suppress;
+          double inter_hb_scale;
+          if (same_molecule) {
+            // Intra pair: no inter-gate suppression; intra occ does not suppress itself here.
+            inter_hb_scale = 1.0;
+          } else {
+            double suppress_i = ramp2(i_hb_occupancy);
+            double suppress_j = ramp2(j_hb_occupancy);
+            double max_suppress = (suppress_i > suppress_j) ? suppress_i : suppress_j;
+            inter_hb_scale = 1.0 - 0.5 * max_suppress;  // was 1.0*max_suppress
+          }
 
           // ---------------------------------------------------------------
-          // (B) INTRA SUPPRESSION BY INTER: add repulsive penalty on the
-          //     intramolecular HB bonded pairs of i and j when inter occ is high.
-          //     This directly destabilizes the intra HB when inter is formed.
-          //     We apply it as an additional energy/force contribution here.
           // ---------------------------------------------------------------
-          // Scale of repulsion: when inter_occ >= 1, apply full repulsion
-          double intra_suppress_i = ramp1(i_inter_occ);  // 0 when no inter, 1 when inter formed
+          // REPULSIVE PENALTY: when inter-HB is formed (intra_suppress > 0.5),
+          // apply a soft repulsion between i and j (the current intra pair)
+          // to destabilize the intra contact. This acts directly on the pair
+          // being evaluated, not on pre-declared bond partners.
+          // Only applied to same-molecule pairs.
+          // ---------------------------------------------------------------
+          double intra_suppress_i = ramp1(i_inter_occ);
           double intra_suppress_j = ramp1(j_inter_occ);
 
-          // Apply repulsive penalty to intramolecular HB bond partners of i
-          if (intra_suppress_i > 1e-6) {
-            int num_b_i = atom->num_bond[i];
-            int *btype_i = atom->bond_type[i];
-            int *batom_i = atom->bond_atom[i];
-            tagint *tag = atom->tag;
-            int total_arr = atom->nlocal + atom->nghost;
-            for (int ib = 0; ib < num_b_i; ib++) {
-              if (btype_i[ib] <= 1) continue;
-              tagint bonded_tag = batom_i[ib];
-              int bonded_idx = -1;
-              for (int k = 0; k < total_arr; k++) {
-                if (tag[k] == bonded_tag) { bonded_idx = k; break; }
-              }
-              if (bonded_idx < 0) continue;
-              // Only intra bonds (same molecule)
-              if (atom->molecule[bonded_idx] != mol_i) continue;
-
-              double dx = x[i][0] - x[bonded_idx][0];
-              double dy = x[i][1] - x[bonded_idx][1];
-              double dz = x[i][2] - x[bonded_idx][2];
-              double bd = sqrt(dx*dx + dy*dy + dz*dz);
-              if (bd < 1e-6) continue;
-
-              // Soft repulsion: U_rep = epsilon_hb * intra_suppress * exp(-(bd-r_hb)^2/sigma^2)
-              // This cancels the intra HB well when inter is formed
-              const double eps_rep = 0.08, r_rep = 6.5, sig_rep = 0.8;
-              double dr_rep = bd - r_rep;
+          if (same_molecule) {
+            double intra_suppress = (intra_suppress_i + intra_suppress_j) * 0.5;
+            if (intra_suppress > 0.5) {
+              const double eps_rep = 0.07, r_rep = 6.5, sig_rep = 0.8;
+              double dr_rep = r - r_rep;
               double sigma_sq = sig_rep * sig_rep;
-              double u_rep = eps_rep * intra_suppress_i * exp(-dr_rep*dr_rep / sigma_sq);
-              double f_rep = u_rep * (2.0 * dr_rep / sigma_sq) / bd;
-
-              // Apply to atom i (force away from bonded partner)
-              f[i][0] += f_rep * dx;
-              f[i][1] += f_rep * dy;
-              f[i][2] += f_rep * dz;
-              // Apply reaction to bonded_idx if local
-              if (bonded_idx < atom->nlocal) {
-                f[bonded_idx][0] -= f_rep * dx;
-                f[bonded_idx][1] -= f_rep * dy;
-                f[bonded_idx][2] -= f_rep * dz;
-              }
-              // Add to energy (avoid double counting: only when i < bonded_idx)
-              if (eflag && i < bonded_idx) {
-                evdwl += u_rep;
-              }
+              double u_rep = eps_rep * intra_suppress * exp(-dr_rep*dr_rep / sigma_sq);
+              double f_rep_mag = u_rep * (2.0 * dr_rep / sigma_sq) * rinv;
+              // accumulate into fpair (radial, same sign convention as Morse)
+              fpair += f_rep_mag;
+              if (eflag) evdwl += u_rep;
             }
           }
 
-          // Apply repulsive penalty to intramolecular HB bond partners of j
-          if (intra_suppress_j > 1e-6) {
-            int num_b_j = atom->num_bond[j];
-            int *btype_j = atom->bond_type[j];
-            int *batom_j = atom->bond_atom[j];
-            tagint *tag = atom->tag;
-            int total_arr = atom->nlocal + atom->nghost;
-            for (int jb = 0; jb < num_b_j; jb++) {
-              if (btype_j[jb] <= 1) continue;
-              tagint bonded_tag = batom_j[jb];
-              int bonded_idx = -1;
-              for (int k = 0; k < total_arr; k++) {
-                if (tag[k] == bonded_tag) { bonded_idx = k; break; }
-              }
-              if (bonded_idx < 0) continue;
-              if (atom->molecule[bonded_idx] != mol_j) continue;
-
-              double dx = x[j][0] - x[bonded_idx][0];
-              double dy = x[j][1] - x[bonded_idx][1];
-              double dz = x[j][2] - x[bonded_idx][2];
-              double bd = sqrt(dx*dx + dy*dy + dz*dz);
-              if (bd < 1e-6) continue;
-
-              const double eps_rep = 0.08, r_rep = 6.5, sig_rep = 0.8;
-              double dr_rep = bd - r_rep;
-              double sigma_sq = sig_rep * sig_rep;
-              double u_rep = eps_rep * intra_suppress_j * exp(-dr_rep*dr_rep / sigma_sq);
-                
-                
-              double f_rep = u_rep * (2.0 * dr_rep / sigma_sq) / bd;
-
-              f[j][0] += f_rep * dx;
-              f[j][1] += f_rep * dy;
-              f[j][2] += f_rep * dz;
-              if (bonded_idx < atom->nlocal) {
-                f[bonded_idx][0] -= f_rep * dx;
-                f[bonded_idx][1] -= f_rep * dy;
-                f[bonded_idx][2] -= f_rep * dz;
-              }
-              if (eflag && j < bonded_idx) {
-                evdwl += u_rep;
-              }
-            }
-          }
-
-          // Still require different molecules; always enter the block (scale handles suppression)
-          if (different_molecules) {
+          // ---------------------------------------------------------------
+          // HB POTENTIAL: active for pairs that are NOT:
+          //   - 1-2 or 1-3 bonded (backbone neighbors), AND
+          //   - already connected by a declared HB bond (bond type > 1).
+          // HB bonds are excluded here to avoid double-counting with the
+          // bonded part, but they DO contribute to compute_intra_occ above.
+          // Same molecule or different molecule — geometry decides.
+          // ---------------------------------------------------------------
+          bool are_bonded_12_13_14 = is_bonded_12_13_14(i, j);
+          bool are_hb_bonded    = is_hb_bond(i, j);
+          if (!are_bonded_12_13_14 && !are_hb_bonded) {
             
             // Guard: compute_normal_vector needs i-1, i, i+1 and j-1, j, j+1 to be valid.
             // Use total array size (local + ghost) as the bound.
@@ -517,9 +488,35 @@ void PairHBNonbonded::compute(int eflag, int vflag)
               double h1 = exp((fabs(alpha_i) - 1.0) / sigma_sq);
               double h2 = exp((fabs(alpha_j) - 1.0) / sigma_sq);
               
-              double r_shifted = r * pow(2.0, 1.0/6.0);  // r_effective = 2^(1/6) * r
-              double r_ratio = r_hb[itype][jtype] / r_shifted;
-              double barrier = A_barrier[itype][jtype] * pow(r_ratio, 12.0);
+              // ---- Soft-capped repulsive barrier ----
+              // The raw barrier ~ (r_hb/r)^12 diverges as r -> 0 (force ~1/r^13,
+              // steeper than Morse or electrostatics). A transient close contact
+              // during an HB forming/breaking event can push r into this regime
+              // faster than the timestep can resolve, giving a force spike large
+              // enough to move an atom past comm_modify cutoff in one step -> the
+              // "Bond atoms missing" crash. Below r_cap we switch to a linear
+              // (constant-force) extrapolation that matches value and slope at
+              // r_cap, so the potential stays C1-continuous and the force is
+              // bounded. r_cap_ratio=0.75 leaves the wall untouched in the
+              // physically relevant range and only clips the pathological regime;
+              // tune if it turns out to bite during normal HB formation.
+              const double r_cap_ratio = 0.75;
+              double r_cap = r_cap_ratio * r_hb[itype][jtype];
+
+              double barrier, dbarrier_dr_capped;
+              if (r >= r_cap) {
+                double r_shifted = r * pow(2.0, 1.0/6.0);  // r_effective = 2^(1/6) * r
+                double r_ratio = r_hb[itype][jtype] / r_shifted;
+                barrier = A_barrier[itype][jtype] * pow(r_ratio, 12.0);
+                dbarrier_dr_capped = -12.0 * barrier * rinv;
+              } else {
+                double r_shifted_cap = r_cap * pow(2.0, 1.0/6.0);
+                double r_ratio_cap = r_hb[itype][jtype] / r_shifted_cap;
+                double barrier_cap = A_barrier[itype][jtype] * pow(r_ratio_cap, 12.0);
+                double dbarrier_dr_cap = -12.0 * barrier_cap / r_cap;  // constant (bounded) force below r_cap
+                barrier = barrier_cap + dbarrier_dr_cap * (r - r_cap);
+                dbarrier_dr_capped = dbarrier_dr_cap;
+              }
               
               u_hb = (h0 * h1 * h2 + barrier) * inter_hb_scale * factor_lj;
 
@@ -539,7 +536,7 @@ void PairHBNonbonded::compute(int eflag, int vflag)
 
               // ========== FORCE CALCULATION (NON-RADIAL) ==========
               double dh0_dr = h0 * (-2.0 * dr_hb / sigma_sq);
-              double dbarrier_dr = -12.0 * barrier * rinv;
+              double dbarrier_dr = dbarrier_dr_capped;  // bounded, see capping block above
               
               double sgn_alpha_i = (fabs(alpha_i) < EPSILON) ? 0.0 : ((alpha_i > 0.0) ? 1.0 : -1.0);
               double sgn_alpha_j = (fabs(alpha_j) < EPSILON) ? 0.0 : ((alpha_j > 0.0) ? 1.0 : -1.0);
@@ -566,12 +563,12 @@ void PairHBNonbonded::compute(int eflag, int vflag)
                               * inter_hb_scale * factor_lj;
                 }                             // smooth suppression
             }  // end can_compute_hb
-          }  // end different_molecules && !i_has_close_hb_bond && !j_has_close_hb_bond
+          }  // end !are_bonded_12_13 && !are_hb_bonded
         }  // end epsilon_hb check
 
         // ========== APPLY FORCES ==========
-        // Radial forces (Morse + Electrostatics): F_radial = fpair * r_hat
-        fpair = f_morse + f_elec;
+        // Radial forces (Morse + Electrostatics + repulsive penalty): F_radial = fpair * r_hat
+        fpair += f_morse + f_elec;
         
         // Apply radial forces
         f[i][0] += delx * fpair;

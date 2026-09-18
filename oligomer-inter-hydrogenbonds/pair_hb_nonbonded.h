@@ -57,7 +57,7 @@ class PairHBNonbonded : public Pair {
   double kappa;          // Screening parameter
   double dielectric;     // Dielectric constant
   double qqrd2e;         // Charge conversion factor
-  
+  double hb_parallel_threshold;   // <-- ADD THIS LINE
   // Control flags
   int use_hb_exclusion;  // Flag to exclude electrostatics when HB active
   
